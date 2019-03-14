@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.*;
 import org.slf4j.Logger;
@@ -105,8 +106,8 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
     private final ConcurrentMap<Pair<RepairJobDesc, SyncNodePair>, CompletableRemoteSyncTask> syncingTasks = new ConcurrentHashMap<>();
 
     // Tasks(snapshot, validate request, differencing, ...) are run on taskExecutor
-    public final ListeningExecutorService taskExecutor = MoreExecutors.listeningDecorator(DebuggableThreadPoolExecutor.createCachedThreadpoolWithMaxSize("RepairJobTask"));
-    private final boolean optimiseStreams;
+    public final ListeningExecutorService taskExecutor;
+    public final boolean optimiseStreams;
 
     private volatile boolean terminated = false;
 
@@ -172,6 +173,12 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
         this.pullRepair = pullRepair;
         this.skippedReplicas = forceSkippedReplicas;
         this.optimiseStreams = optimiseStreams;
+        this.taskExecutor = MoreExecutors.listeningDecorator(createExecutor());
+    }
+
+    protected DebuggableThreadPoolExecutor createExecutor()
+    {
+        return DebuggableThreadPoolExecutor.createCachedThreadpoolWithMaxSize("RepairJobTask");
     }
 
     public UUID getId()
@@ -189,12 +196,12 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
         return commonRange.endpoints;
     }
 
-    public void waitForValidation(Pair<RepairJobDesc, InetAddressAndPort> key, ValidationTask task)
+    public void trackValidationCompletion(Pair<RepairJobDesc, InetAddressAndPort> key, ValidationTask task)
     {
         validating.put(key, task);
     }
 
-    public void waitForSync(Pair<RepairJobDesc, SyncNodePair> key, CompletableRemoteSyncTask task)
+    public void trackSyncCompletion(Pair<RepairJobDesc, SyncNodePair> key, CompletableRemoteSyncTask task)
     {
         syncingTasks.put(key, task);
     }
@@ -230,7 +237,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
      */
     public void syncComplete(RepairJobDesc desc, SyncNodePair nodes, boolean success, List<SessionSummary> summaries)
     {
-        CompletableRemoteSyncTask task = syncingTasks.get(Pair.create(desc, nodes));
+        CompletableRemoteSyncTask task = syncingTasks.remove(Pair.create(desc, nodes));
         if (task == null)
         {
             assert terminated;
@@ -240,6 +247,12 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
         if (logger.isDebugEnabled())
             logger.debug("{} Repair completed between {} and {} on {}", previewKind.logPrefix(getId()), nodes.coordinator, nodes.peer, desc.columnFamily);
         task.syncComplete(success, summaries);
+    }
+
+    @VisibleForTesting
+    Map<Pair<RepairJobDesc, SyncNodePair>, CompletableRemoteSyncTask> getSyncingTasks()
+    {
+        return Collections.unmodifiableMap(syncingTasks);
     }
 
     private String repairedNodes()
@@ -305,7 +318,7 @@ public class RepairSession extends AbstractFuture<RepairSessionResult> implement
         List<ListenableFuture<RepairResult>> jobs = new ArrayList<>(cfnames.length);
         for (String cfname : cfnames)
         {
-            RepairJob job = new RepairJob(this, cfname, isIncremental, previewKind, optimiseStreams);
+            RepairJob job = new RepairJob(this, cfname);
             executor.execute(job);
             jobs.add(job);
         }
